@@ -54,30 +54,6 @@ public class ElasticsearchService(IElasticClient client, ILogger<IElasticsearchS
         }
     }
 
-    public async Task IndexDocumentAsync<T>(T document, CancellationToken ct) where T : class
-    {
-        logger.LogInformation("Indexing document {@Document}", document);
-        var response = await client.IndexDocumentAsync(document, ct).ConfigureAwait(false);
-        
-        if (!response.IsValid)
-        {
-            logger.LogError("Indexing document failed with {Error}", response.DebugInformation);
-        }
-    }
-
-    public async Task<T> GetDocumentAsync<T>(string id, CancellationToken ct) where T : class
-    {
-        logger.LogInformation("Getting document with ID {Id}", id);
-        var response = await client.GetAsync<T>(id, ct: ct).ConfigureAwait(false);
-        
-        if (!response.IsValid)
-        {
-            logger.LogError("Getting document failed with {Error}", response.DebugInformation);
-        }
-        
-        return response.Source;
-    }
-
     public async Task<IEnumerable<T>> SearchDocumentsAsync<T>(string query, CancellationToken ct) where T : class
     {
         logger.LogInformation("Searching documents with query {Query}", query);
