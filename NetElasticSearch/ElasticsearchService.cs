@@ -1,27 +1,34 @@
-﻿using Nest;
+﻿using System.Linq.Expressions;
+using System.Text.RegularExpressions;
+using Nest;
 
 namespace NetElasticSearch;
 
 public interface IElasticsearchService
 {
-    Task BulkIndexDocumentsAsync<T>(IAsyncEnumerable<T> documents, CancellationToken ct) where T : class;
-    Task<IEnumerable<T>> SearchDocumentsAsync<T>(string query, CancellationToken ct) where T : class;
+    Task BulkIndexDocumentsAsync(IAsyncEnumerable<TransactionDocument?> documents, CancellationToken ct);
+    Task<IEnumerable<TransactionDocument>> SearchDocumentsAsync(string query, CancellationToken ct);
 }
 
 public class ElasticsearchService(IElasticClient client, ILogger<IElasticsearchService> logger) : IElasticsearchService
 {
-    public async Task BulkIndexDocumentsAsync<T>(IAsyncEnumerable<T> documents, CancellationToken ct) where T : class
+    public async Task BulkIndexDocumentsAsync(IAsyncEnumerable<TransactionDocument?> documents, CancellationToken ct)
     {
         logger.LogInformation("Starting bulk indexing documents");
         var bulkRequest = new BulkDescriptor();
         var count = 0;
-        var indexedDocuments = new List<T>();
+        var indexedDocuments = new List<TransactionDocument>();
         var batchSize = 1000;
 
         await foreach (var document in documents.WithCancellation(ct))
         {
+            if (document == null)
+            {
+                continue;
+            }
+            
             indexedDocuments.Add(document);
-            bulkRequest.Index<T>(op => op.Document(document));
+            bulkRequest.Index<TransactionDocument>(op => op.Document(document));
 
             count++;
 
@@ -48,27 +55,73 @@ public class ElasticsearchService(IElasticClient client, ILogger<IElasticsearchS
         logger.LogInformation("Sending bulk request with {Count} documents", ((IBulkRequest)bulkRequest).Operations.Count);
         var bulkResponse = await client.BulkAsync(bulkRequest, ct).ConfigureAwait(false);
         
-        if (!bulkResponse.IsValid)
+        if (bulkResponse.Errors)
         {
             logger.LogError("Bulk request failed with {Error}", bulkResponse.DebugInformation);
         }
     }
 
-    public async Task<IEnumerable<T>> SearchDocumentsAsync<T>(string query, CancellationToken ct) where T : class
+    public Task<IEnumerable<TransactionDocument>> SearchDocumentsAsync(string query, CancellationToken ct)
     {
-        logger.LogInformation("Searching documents with query {Query}", query);
-        var searchResponse = await client.SearchAsync<T>(s => s
-            .Query(q => q
-                .QueryString(d => d
-                    .Query(query)
-                )   
-            ).Size(100), ct).ConfigureAwait(false);
-        
-        if (!searchResponse.IsValid)
+        if (string.IsNullOrWhiteSpace(query))
         {
-            logger.LogError("Searching documents failed with {Error}", searchResponse.DebugInformation);
+            return Task.FromResult(Enumerable.Empty<TransactionDocument>());
         }
-        
-        return searchResponse.Documents;
+
+        logger.LogInformation("Searching documents with query {Query}", query);
+
+        var regexFieldMap = new Dictionary<Regex, Expression<Func<TransactionDocument, object>>>
+        {
+            { TransactionRegex.AMOUNT_REGEX, f => f.Amount.Suffix("keyword") },
+            { TransactionRegex.DATE_REGEX, f => f.Date.Suffix("keyword") },
+            { TransactionRegex.TRXNID_REGEX, f => f.TransactionID.Suffix("keyword") }
+        };
+
+        foreach (var (regex, field) in regexFieldMap)
+        {
+            if (regex.IsMatch(query))
+            {
+                return ExecuteScrollQueryAsync(q => q
+                    .Term(t => t
+                        .Field(field)
+                        .Value(query)
+                    ), ct);
+            }
+        }
+
+        return ExecuteScrollQueryAsync(q => q
+            .MatchPhrase(m => m
+                    .Field(f => f.Message)
+                    .Query(query)
+            ), ct);
+    }
+
+    private async Task<IEnumerable<TransactionDocument>> ExecuteScrollQueryAsync(
+        Func<QueryContainerDescriptor<TransactionDocument>, QueryContainer> query, CancellationToken ct)
+    {
+        var scrollTimeout = "2m"; // Scroll timeout duration
+        var scrollSize = 1000; // Number of documents per scroll batch
+
+        var searchResponse = await client.SearchAsync<TransactionDocument>(s => s
+            .Scroll(scrollTimeout)
+            .Size(scrollSize)
+            .Query(query), ct).ConfigureAwait(false);
+
+        var results = new List<TransactionDocument>(searchResponse.Documents);
+
+        // Continue scrolling until no more documents
+        while (searchResponse.Documents.Any())
+        {
+            var scrollId = searchResponse.ScrollId;
+
+            searchResponse = await client.ScrollAsync<TransactionDocument>(scrollTimeout, scrollId, ct: ct)
+                .ConfigureAwait(false);
+            results.AddRange(searchResponse.Documents);
+        }
+
+        // Clear the scroll context when done
+        await client.ClearScrollAsync(new ClearScrollRequest(searchResponse.ScrollId), ct);
+
+        return results;
     }
 }

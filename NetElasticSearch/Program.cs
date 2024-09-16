@@ -35,7 +35,7 @@ app.UseHttpsRedirection();
 app.UseOutputCache();
 app.UseSerilogRequestLogging();
 
-app.MapGet("/mttq", ([FromQuery] string query, [FromServices] IElasticsearchService elasticsearchService, CancellationToken ct) => elasticsearchService.SearchDocumentsAsync<TransactionDocument>(query, ct))
+app.MapGet("/mttq", ([FromQuery] string query, [FromServices] IElasticsearchService elasticsearchService, CancellationToken ct) => elasticsearchService.SearchDocumentsAsync(query, ct))
     .CacheOutput(opt =>
     {
         opt.Cache();
@@ -43,12 +43,27 @@ app.MapGet("/mttq", ([FromQuery] string query, [FromServices] IElasticsearchServ
     })
     .WithName("GetTransactionDocuments");
 
-app.MapPost("/mttq", async ([FromForm(Name = "json-file")] IFormFile file, [FromServices] IElasticsearchService elasticsearchService, CancellationToken ct) =>
+app.MapPost("/mttq", async (HttpRequest request, [FromServices] IElasticsearchService elasticsearchService, CancellationToken ct) =>
+{
+    var form = await request.ReadFormAsync(ct);
+    var files = form.Files;
+    
+    if (files.Count == 0)
     {
-        await using var jsonDataStream = file.OpenReadStream();
-        await elasticsearchService.BulkIndexDocumentsAsync(JsonSerializer.DeserializeAsyncEnumerable<TransactionDocument>(jsonDataStream), ct).ConfigureAwait(false);
-        
-        return Results.Ok("Documents indexed successfully.");
+        return Results.BadRequest("No files were uploaded.");
+    }
+
+    var tasks = files.Where(x => x is { Length: > 0, ContentType: "application/json" })
+        .Select(file => Task.Run(async () =>
+        {
+            await using var jsonDataStream = file.OpenReadStream();
+            await elasticsearchService.BulkIndexDocumentsAsync(JsonSerializer.DeserializeAsyncEnumerable<TransactionDocument>(jsonDataStream), ct).ConfigureAwait(false);
+        }))
+        .ToList();
+
+    await Task.WhenAll(tasks).ConfigureAwait(false);
+
+    return Results.Ok("Documents indexed successfully.");
     })
     .DisableRequestTimeout()
     .DisableAntiforgery()

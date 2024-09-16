@@ -8,7 +8,7 @@ public class TransactionDocument
     public string Date { get; set; }
 
     [JsonPropertyName("trans_id")]
-    public string Id { get; set; }
+    public string TransactionID { get; set; }
 
     [JsonPropertyName("amount")]
     public string Amount { get; set; }
